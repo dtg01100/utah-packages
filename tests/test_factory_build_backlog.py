@@ -125,7 +125,7 @@ def _populate(root: Path, *, recipes: list[str], locked: list[str], packit: list
 
 
 class CatalogTotalsTests(unittest.TestCase):
-    def test_collects_one_set_per_area(self) -> None:
+    def test_collects_one_list_per_area(self) -> None:
         catalog = tomllib.loads(
             '[areas.a]\npackages = ["x", "y"]\n'
             '[areas.b]\npackages = ["z"]\n'
@@ -134,9 +134,19 @@ class CatalogTotalsTests(unittest.TestCase):
         )
         all_backlog, by_area, wontfix, resolved = backlog._catalog_totals(catalog)
         self.assertEqual(all_backlog, {"x", "y", "z"})
-        self.assertEqual(by_area, {"a": {"x", "y"}, "b": {"z"}})
+        self.assertEqual(by_area, {"a": ["x", "y"], "b": ["z"]})
         self.assertEqual(wontfix, set())
         self.assertEqual(resolved, set())
+
+    def test_keeps_a_repeat_inside_one_area(self) -> None:
+        """A within-area repeat must survive so ``_report`` can reject it."""
+        catalog = tomllib.loads(
+            '[areas.a]\npackages = ["x", "x"]\n'
+            '[resolved]\npackages = []\n'
+            '[wontfix]\npackages = []\n'
+        )
+        _, by_area, _, _ = backlog._catalog_totals(catalog)
+        self.assertEqual(by_area, {"a": ["x", "x"]})
 
 
 class ClassifyTests(unittest.TestCase):
@@ -385,13 +395,14 @@ class CatalogConsistencyTests(unittest.TestCase):
             f"factory-build-backlog.toml must record all {self.CATALOG_TOTAL} names "
             "(sum of areas + [resolved] + [wontfix]) from issue #308",
         )
-        # Every name appears in exactly one area; duplicates would inflate the count above the area total.
+        # Every name appears in exactly one area, once: a repeat inside an
+        # area or across two areas would inflate the count above the area total.
         per_name = {}
         for area, names in by_area.items():
             for name in names:
                 per_name[name] = per_name.get(name, 0) + 1
         duplicates = sorted(name for name, count in per_name.items() if count != 1)
-        self.assertEqual(duplicates, [], f"catalog lists names in more than one area: {duplicates}")
+        self.assertEqual(duplicates, [], f"catalog lists names more than once: {duplicates}")
         # Resolved and wontfix entries must not appear in any area: the catalog
         # design says once a name leaves the backlog it must land in one of
         # these two tables, and the next import must move it.
@@ -476,7 +487,22 @@ class CatalogOverlapTests(unittest.TestCase):
             _populate(root, recipes=[], locked=[], packit=[], manifest=[])
             with self.assertRaises(SystemExit) as caught:
                 backlog._report(root, catalog_path)
-            self.assertIn("more than one area", str(caught.exception))
+            self.assertIn("more than once", str(caught.exception))
+            self.assertIn("tuned", str(caught.exception))
+
+    def test_duplicate_within_one_area_exits(self) -> None:
+        """A name repeated inside a single area breaks the same contract."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog_path = _toml(
+                root,
+                areas={"power": ["tuned", "tuned"]},
+            )
+            _populate(root, recipes=[], locked=[], packit=[], manifest=[])
+            with self.assertRaises(SystemExit) as caught:
+                backlog._report(root, catalog_path)
+            self.assertIn("more than once", str(caught.exception))
+            self.assertIn("tuned", str(caught.exception))
 
 
 class CheckGateTests(unittest.TestCase):

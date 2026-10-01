@@ -16,7 +16,10 @@ snapshot stays trustworthy in CI.
 
 Partitions:
 
-- ``already_recipe``   — a directory exists under ``packages/<name>/``
+- ``already_recipe``   — a directory exists under ``packages/<name>/``, or
+  the name is a ``%package`` subpackage of such a spec (explicit
+  ``%package -n NAME`` or implicit ``%package SUFFIX``, which names
+  ``<spec>-SUFFIX``): the factory build that ships the parent also ships it
 - ``already_locked``   — ``config/upstream-sources.json`` has a lock entry
 - ``already_packit``   — ``.packit.yaml`` has a package block
 - ``manifest_wants``   — ``config/bluefin-packages.toml`` lists the name
@@ -223,11 +226,18 @@ def _classify(
     return "pending"
 
 
-def _catalog_totals(catalog: dict) -> tuple[set[str], dict[str, set[str]], set[str], set[str]]:
-    """Pull the catalog's three name sets: backlog, wontfix, resolved."""
-    backlog: dict[str, set[str]] = {}
+def _catalog_totals(catalog: dict) -> tuple[set[str], dict[str, list[str]], set[str], set[str]]:
+    """Pull the catalog's three name sets: backlog, wontfix, resolved.
+
+    The per-area value is a ``list``, not a ``set``: de-duplicating here
+    would hide a name repeated inside a single area's ``packages`` list,
+    and the catalog contract is that a backlog name appears exactly once
+    across the whole catalog. ``_report`` counts occurrences and rejects
+    any repeat, within an area or across two of them.
+    """
+    backlog: dict[str, list[str]] = {}
     for area, info in catalog.get("areas", {}).items():
-        backlog[area] = set(info.get("packages", []))
+        backlog[area] = list(info.get("packages", []))
     resolved = {entry["name"] for entry in catalog.get("resolved", {}).get("packages", [])}
     wontfix = {entry["name"] for entry in catalog.get("wontfix", {}).get("packages", [])}
     all_backlog: set[str] = set()
@@ -248,7 +258,8 @@ def _report(root: Path, catalog_path: Path) -> dict:
 
     all_backlog, by_area, wontfix_set, resolved_set = _catalog_totals(catalog)
 
-    # The catalog is the contract: any name in the backlog appears exactly once.
+    # The catalog is the contract: any name in the backlog appears exactly
+    # once -- not twice in one area's list, and not once in each of two areas.
     seen: dict[str, int] = {}
     for area, names in by_area.items():
         for name in names:
@@ -256,7 +267,8 @@ def _report(root: Path, catalog_path: Path) -> dict:
     duplicates = sorted(name for name, count in seen.items() if count != 1)
     if duplicates:
         raise SystemExit(
-            f"catalog lists these names in more than one area: {duplicates}"
+            "catalog lists these names more than once (repeated within an area "
+            f"or present in more than one area): {duplicates}"
         )
     # A name that has moved out of the backlog (``[resolved]`` or ``[wontfix]``)
     # MUST NOT also appear in any area: the documented closing contract is a
@@ -390,9 +402,9 @@ def _check(report: dict, path: Path) -> int:
     # Totals and states are blind to a name moving between areas or two names
     # of the same state swapping places, so compare the rollup and the entry
     # list themselves. ``report["entries"]`` always has exactly
-    # ``totals["backlog"]`` items (the per-area loop at :269-281 emits one
-    # entry per backlog name) so an entries-vs-backlog count check is
-    # unreachable and is not duplicated here.
+    # ``totals["backlog"]`` items (``_report``'s per-area classification loop
+    # emits one entry per backlog name) so an entries-vs-backlog count check
+    # is unreachable and is not duplicated here.
     backlog = report["totals"]["backlog"]
     if report["areas"] != on_disk.get("areas"):
         moved = sorted(

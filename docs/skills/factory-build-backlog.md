@@ -40,7 +40,7 @@ The auditor classifies each catalog name into exactly one state:
 
 | State | Meaning |
 | --- | --- |
-| `already_recipe` | A directory exists under `packages/<name>/` |
+| `already_recipe` | A directory exists under `packages/<name>/`, or the name is a `%package` subpackage of such a spec |
 | `already_locked` | `config/upstream-sources.json` has a lock entry |
 | `already_packit` | `.packit.yaml` has a package block |
 | `manifest_wants` | `config/bluefin-packages.toml` lists the name |
@@ -79,6 +79,10 @@ itself fails when the catalog totals do not reconcile with the report.
 - A `pending` count that shrinks without a commit means someone dropped a
   name from the catalog without recording the decision; `git log -p
   config/factory-build-backlog.toml` is the fastest trace.
-- `manifest_wants` for a binary subpackage (`ffmpeg-libs`, `mesa-libEGL`,
-  ...) means the source package's recipe covers it: read the recipe, not
-  the binary name.
+- `already_recipe` for a binary subpackage (`libavcodec`,
+  `gstreamer1-plugins-good-qt6`, ...) means the source package's recipe
+  declares it with a `%package` line: read the recipe, not the binary name.
+  The auditor resolves both `%package -n NAME` and `%package SUFFIX` (which
+  names `<spec>-SUFFIX`). A binary name no `%package` line declares — such
+  as `ffmpeg-libs`, which RPM never builds under that name here — stays
+  `pending` until the operator closes it in `[resolved]` or `[wontfix]`.
