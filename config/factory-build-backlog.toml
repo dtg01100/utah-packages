@@ -16,7 +16,10 @@
 #
 # A name added here MUST also appear in the audited list referenced
 # by `[meta].audit_source`; the contract test
-# `tests/test_factory_build_backlog.py` enforces that.
+# `tests/test_factory_build_backlog.py::CatalogConsistencyTests::test_real_catalog_matches_the_audit_count`
+# enforces that every name in areas + [resolved] + [wontfix] matches the
+# 551-name audit count, and the overlap checks reject any name that
+# appears in more than one of those three tables.
 #
 # Removing a name requires two edits: drop it here AND mark it in
 # `[resolved]` (recipe imported) or `[wontfix]` (decided not to
@@ -649,6 +652,7 @@ packages = []
 [wontfix]
 # Packages deliberately decided not to carry. Each entry: package
 # name and a short reason with an issue link. Empty until a
-# maintainer records a decision; the auditor reports these as
-# resolved too.
+# maintainer records a decision. Wontfixed names are NOT in ``states``;
+# they are surfaced as ``totals.wontfix`` so the count partition
+# (areas + resolved + wontfix) still equals the audit's 551.
 packages = []

@@ -1,8 +1,8 @@
 {
   "areas": {
     "codecs-media": {
-      "already_recipe": 1,
-      "pending": 48,
+      "already_recipe": 8,
+      "pending": 41,
       "total": 49
     },
     "dev-tools": {
@@ -137,27 +137,27 @@
     {
       "area": "codecs-media",
       "name": "libavcodec",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
       "name": "libavdevice",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
       "name": "libavfilter",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
       "name": "libavformat",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
       "name": "libavutil",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
@@ -222,12 +222,12 @@
     {
       "area": "codecs-media",
       "name": "libswresample",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
       "name": "libswscale",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
@@ -2807,9 +2807,9 @@
   ],
   "issue": "projectbluefin/utah-packages#308",
   "states": {
-    "already_recipe": 1,
+    "already_recipe": 8,
     "manifest_wants": 1,
-    "pending": 549
+    "pending": 542
   },
   "totals": {
     "backlog": 551,

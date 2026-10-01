@@ -143,24 +143,42 @@ class ClassifyTests(unittest.TestCase):
     """The partition order is significant: the strongest signal wins."""
 
     def test_recipe_wins_over_lock(self) -> None:
-        state = backlog._classify("fish", recipes={"fish"}, locks={"fish"}, packit={"fish"}, manifest={"fish"})
+        state = backlog._classify("fish", recipes={"fish"}, subpackages=set(), locks={"fish"}, packit={"fish"}, manifest={"fish"})
         self.assertEqual(state, "already_recipe")
 
     def test_lock_wins_over_packit(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks={"fish"}, packit={"fish"}, manifest={"fish"})
+        state = backlog._classify("fish", recipes=set(), subpackages=set(), locks={"fish"}, packit={"fish"}, manifest={"fish"})
         self.assertEqual(state, "already_locked")
 
     def test_packit_wins_over_manifest(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit={"fish"}, manifest={"fish"})
+        state = backlog._classify("fish", recipes=set(), subpackages=set(), locks=set(), packit={"fish"}, manifest={"fish"})
         self.assertEqual(state, "already_packit")
 
     def test_manifest_wins_over_pending(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest={"fish"})
+        state = backlog._classify("fish", recipes=set(), subpackages=set(), locks=set(), packit=set(), manifest={"fish"})
         self.assertEqual(state, "manifest_wants")
 
     def test_pending_when_no_signal(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest=set())
+        state = backlog._classify("fish", recipes=set(), subpackages=set(), locks=set(), packit=set(), manifest=set())
         self.assertEqual(state, "pending")
+
+    def test_subpackage_wins_over_everything(self) -> None:
+        # A name that is a ``%package -n`` subpackage of an existing recipe
+        # is built by the factory even when no other signal is present --
+        # a fresh spec with only ``%package -n libavcodec`` lines (no
+        # packit, no lock, no manifest) still resolves to ``already_recipe``.
+        state = backlog._classify("libavcodec", recipes=set(), subpackages={"libavcodec"}, locks=set(), packit=set(), manifest=set())
+        self.assertEqual(state, "already_recipe")
+
+    def test_subpackage_does_not_mask_recipe_partition(self) -> None:
+        # If a name happens to match both ``recipes`` and ``subpackages``,
+        # it still resolves to ``already_recipe`` (the same state). The
+        # ``subpackages`` set only matters when ``recipes`` is empty --
+        # which is the whole point of classifying subpackage names
+        # without false-positiving on names that already have their own
+        # recipe directory.
+        state = backlog._classify("fish", recipes={"fish"}, subpackages={"fish"}, locks=set(), packit=set(), manifest=set())
+        self.assertEqual(state, "already_recipe")
 
 
 class PackitAndLockTests(unittest.TestCase):
@@ -279,15 +297,31 @@ class ReportTests(unittest.TestCase):
 
 
 class CatalogConsistencyTests(unittest.TestCase):
-    """The catalog itself is a contract: 551 total, no duplicates across areas."""
+    """The catalog itself is a contract: 551 total, no duplicates across areas.
+
+    The 551-name audit source is fixed; closing a gap moves a name out of
+    an area into either ``[resolved]`` or ``[wontfix]`` (the two-edit
+    closing contract documented in docs/skills/factory-build-backlog.md).
+    That means the assertion is on the *sum* of the three tables, not on
+    the backlog alone -- a PR that closes a gap without recording the
+    decision would shrink the sum below 551, and a PR that closes a gap
+    with a one-edit (drop only) would shrink the sum below 551 too.
+    """
+
+    CATALOG_TOTAL = 551
 
     def test_real_catalog_matches_the_audit_count(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         with (repo_root / "config" / "factory-build-backlog.toml").open("rb") as handle:
             catalog = tomllib.load(handle)
         all_backlog, by_area, wontfix, resolved = backlog._catalog_totals(catalog)
-        self.assertEqual(len(all_backlog), 551, "factory-build-backlog.toml should record all 551 names from issue #308")
-        # Every name appears in exactly one area; duplicates would inflate the count above 551.
+        self.assertEqual(
+            len(all_backlog) + len(resolved) + len(wontfix),
+            self.CATALOG_TOTAL,
+            f"factory-build-backlog.toml must record all {self.CATALOG_TOTAL} names "
+            "(sum of areas + [resolved] + [wontfix]) from issue #308",
+        )
+        # Every name appears in exactly one area; duplicates would inflate the count above the area total.
         per_name = {}
         for area, names in by_area.items():
             for name in names:
@@ -308,9 +342,18 @@ class CatalogConsistencyTests(unittest.TestCase):
     def test_real_report_matches_the_catalog_total(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         report = backlog._report(repo_root, repo_root / "config" / "factory-build-backlog.toml")
-        self.assertEqual(report["totals"]["backlog"], 551)
+        # The report's totals are a partition of the catalog: backlog +
+        # resolved + wontfix must equal the audit count. ``states`` only
+        # covers backlog entries (every entry is classified once), so
+        # ``sum(states) == backlog`` -- that's the correct shape, not a
+        # regression against the audit count.
+        totals = report["totals"]
+        self.assertEqual(
+            totals["backlog"] + totals["resolved"] + totals["wontfix"],
+            self.CATALOG_TOTAL,
+        )
         states_total = sum(report["states"].values())
-        self.assertEqual(states_total, 551)
+        self.assertEqual(states_total, totals["backlog"])
 
 
 class CatalogOverlapTests(unittest.TestCase):

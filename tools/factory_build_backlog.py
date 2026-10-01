@@ -100,21 +100,99 @@ def _recipe_names(root: Path) -> set[str]:
     return {d.name for d in packages.iterdir() if d.is_dir()}
 
 
-def _classify(name: str, *, recipes: set[str], locks: set[str], packit: set[str], manifest: set[str]) -> str:
+# Macros the auditor resolves when expanding ``%package -n`` lines. These
+# are the conditional suffixes Fedora-style specs use to namespace the
+# free-world rebuild of a package (``-free``) and the no-suffix default
+# (empty string). Other ``%{?...}`` conditionals are intentionally not
+# resolved: if a name is conditionally declared, the auditor stays
+# conservative and treats it as not yet shipped -- the operator can
+# always add the name to ``[resolved]`` to close it explicitly.
+_RECIPE_SUFFIX_RESOLUTIONS = {
+    "pkg_suffix": "",
+    "basepkg_suffix": "",
+}
+
+
+def _expand_recipe_macro(value: str) -> str:
+    """Resolve the auditor's known ``%{name}`` and ``%{?...}`` forms.
+
+    ``%{name}`` and ``%{pkg_name}`` use the spec's own ``Name:`` tag
+    (which the auditor does not parse), so they are left alone and
+    produce names with the macro in place -- which is a conservative
+    miss, not a false positive. ``%{?pkg_suffix}`` / ``%{?basepkg_suffix}``
+    expand to the empty string for the no-suffix build (which is the
+    common case). Anything else is left untouched.
+    """
+    if "%{?pkg_suffix}" in value:
+        value = value.replace("%{?pkg_suffix}", _RECIPE_SUFFIX_RESOLUTIONS["pkg_suffix"])
+    if "%{?basepkg_suffix}" in value:
+        value = value.replace("%{?basepkg_suffix}", _RECIPE_SUFFIX_RESOLUTIONS["basepkg_suffix"])
+    return value
+
+
+def _subpackage_names(root: Path) -> set[str]:
+    """Names declared by ``%package -n`` lines in every spec under ``packages/``.
+
+    A spec may declare multiple binary subpackages in addition to the
+    recipe directory itself (e.g. ``packages/ffmpeg/ffmpeg.spec`` ships
+    ``libavcodec``, ``libavformat``, ``libavutil``, ...). Without this
+    the auditor would count those names as ``pending`` even though a
+    factory build already produces them, which both inflates the
+    "pending" total and forces the operator to close every subpackage
+    by hand.
+    """
+    packages = root / "packages"
+    if not packages.is_dir():
+        return set()
+    names: set[str] = set()
+    for spec in packages.glob("*/[!.]*.spec"):
+        for line in spec.read_text().splitlines():
+            line = line.strip()
+            if not line.startswith("%package"):
+                continue
+            # RPM's ``%package -n NAME`` lets the spec reuse the global
+            # Name with a different one. We only care about the explicit
+            # form; ``%package`` (no ``-n``) inherits the spec's own Name
+            # which the recipe directory already covers.
+            tokens = line.split(None, 3)
+            if len(tokens) < 3 or tokens[1] != "-n":
+                continue
+            candidate = _expand_recipe_macro(tokens[2]).strip()
+            # ``-devel`` and other in-spec splits share the recipe's
+            # provenance; classifying them under ``already_recipe`` is
+            # the right signal -- the factory build that ships the
+            # parent package also ships its -devel sibling.
+            if candidate and not candidate.startswith("-"):
+                names.add(candidate)
+    return names
+
+
+def _classify(
+    name: str,
+    *,
+    recipes: set[str],
+    subpackages: set[str],
+    locks: set[str],
+    packit: set[str],
+    manifest: set[str],
+) -> str:
     """Pick the most-specific partition a name falls into.
 
     Order is significant: the first match wins. ``already_recipe`` is the
-    strongest signal (a full spec + provenance + sources file is present),
-    then ``already_locked`` (source URL is SHA-512 pinned), then
-    ``already_packit`` (Packit block declared), then ``manifest_wants``
-    (consumer asks for it), then ``pending`` (a factory build is still
-    owed). Reordering this list silently changes counts.
+    strongest signal (a full spec + provenance + sources file is present
+    for the package itself, OR the name is a ``%package -n`` subpackage of
+    an existing recipe -- in which case the factory build that ships the
+    parent recipe also ships the subpackage), then ``already_locked``
+    (source URL is SHA-512 pinned), then ``already_packit`` (Packit block
+    declared), then ``manifest_wants`` (consumer asks for it), then
+    ``pending`` (a factory build is still owed). Reordering this list
+    silently changes counts.
 
     Wontfixed names are not classified: leaving the backlog removes the name
     from every area, and ``_report`` rejects a catalog where an area name is
     also in ``[wontfix]``.
     """
-    if name in recipes:
+    if name in recipes or name in subpackages:
         return "already_recipe"
     if name in locks:
         return "already_locked"
@@ -143,6 +221,7 @@ def _report(root: Path, catalog_path: Path) -> dict:
     meta = catalog.get("meta", {})
 
     recipes = _recipe_names(root)
+    subpackages = _subpackage_names(root)
     locks = _lock_names(root / UPSTREAM_PATH.relative_to("."))
     packit = _packit_names(root / PACKIT_PATH.relative_to("."))
     manifest = _manifest_names(root / MANIFEST_PATH.relative_to("."))
@@ -188,7 +267,14 @@ def _report(root: Path, catalog_path: Path) -> dict:
     entries: list[dict] = []
     for area in sorted(by_area):
         for name in sorted(by_area[area]):
-            state = _classify(name, recipes=recipes, locks=locks, packit=packit, manifest=manifest)
+            state = _classify(
+                name,
+                recipes=recipes,
+                subpackages=subpackages,
+                locks=locks,
+                packit=packit,
+                manifest=manifest,
+            )
             partition_counts[state] = partition_counts.get(state, 0) + 1
             entries.append(
                 {
@@ -224,15 +310,18 @@ def _report(root: Path, catalog_path: Path) -> dict:
         "areas": area_rollup,
         "entries": entries,
     }
-    # Inventory spot-check: every name with a recipe must also be in the
-    # inventory's source-locked set, not just in packages/. Mismatches here
-    # mean a recipe was added without updating upstream-sources.json; this is
-    # what catches a half-imported name that the backlog would otherwise call
-    # resolved.
+    # Inventory spot-check: every name with its own recipe (not a
+    # subpackage of one) must also be in the inventory's source-locked set,
+    # not just in packages/. Mismatches here mean a recipe was added
+    # without updating upstream-sources.json; this is what catches a
+    # half-imported name that the backlog would otherwise call resolved.
+    # Subpackages (libavcodec, libavutil, ...) are deliberately skipped:
+    # they share the recipe's provenance, and the inventory tracks the
+    # parent recipe, not the per-binary outputs.
     locked_records = {record.name for record in inventory(root) if record.source_locked}
     inconsistent = []
     for entry in entries:
-        if entry["state"] == "already_recipe" and entry["name"] not in locked_records:
+        if entry["state"] == "already_recipe" and entry["name"] in recipes and entry["name"] not in locked_records:
             inconsistent.append(entry["name"])
     if inconsistent:
         report["inconsistent_recipe_state"] = sorted(inconsistent)
@@ -245,8 +334,8 @@ def _check(report: dict, path: Path) -> int:
     ``--check`` is the gate. The report carries no wall-clock field, so the
     live report and the committed snapshot must be equal byte-for-byte;
     anything else is drift. The messages below name the drifting section
-    (totals, states, entry count, areas, entries, recipe consistency) so a
-    failure says what moved instead of dumping two large dicts.
+    (meta, totals, states, areas, entries, recipe consistency) so a failure
+    says what moved instead of dumping two large dicts.
     """
     if not path.is_file():
         print(f"missing snapshot at {path}; run without --check to regenerate")
@@ -254,20 +343,37 @@ def _check(report: dict, path: Path) -> int:
 
     on_disk = json.loads(path.read_text())
     errors = []
+    # ``[meta]`` (issue, audit_source, the three digest pins, audit_measured_at)
+    # is sourced from the catalog, so a stale snapshot would not catch a
+    # metadata-only edit. Compare the whole ``meta`` block byte-for-byte.
+    if report.get("issue") != on_disk.get("issue"):
+        errors.append(f"issue drift: live {report.get('issue')!r} vs snapshot {on_disk.get('issue')!r}")
+    if report.get("audit_source") != on_disk.get("audit_source"):
+        errors.append(
+            f"audit_source drift: live {report.get('audit_source')!r} vs "
+            f"snapshot {on_disk.get('audit_source')!r}"
+        )
+    for digest in ("audit_digest_bluefin", "audit_digest_utah", "audit_digest_factory"):
+        if report.get(digest) != on_disk.get(digest):
+            errors.append(
+                f"{digest} drift: live {report.get(digest)!r} vs snapshot {on_disk.get(digest)!r}"
+            )
+    if report.get("audit_measured_at") != on_disk.get("audit_measured_at"):
+        errors.append(
+            f"audit_measured_at drift: live {report.get('audit_measured_at')!r} vs "
+            f"snapshot {on_disk.get('audit_measured_at')!r}"
+        )
     if report["totals"] != on_disk.get("totals"):
         errors.append(f"totals drift: live {report['totals']} vs snapshot {on_disk.get('totals')}")
     if report["states"] != on_disk.get("states"):
         errors.append(f"states drift: live {report['states']} vs snapshot {on_disk.get('states')}")
-    # Catalog-vs-live: the catalog has ``N`` backlog names; the report's
-    # entries list has exactly ``N`` items. A count mismatch is a catalog
-    # regression (someone added a name without updating the report).
-    backlog = report["totals"]["backlog"]
-    entries = len(report["entries"])
-    if entries != backlog:
-        errors.append(f"entries drift: {entries} entries for {backlog} backlog names")
     # Totals and states are blind to a name moving between areas or two names
     # of the same state swapping places, so compare the rollup and the entry
-    # list themselves.
+    # list themselves. ``report["entries"]`` always has exactly
+    # ``totals["backlog"]`` items (the per-area loop at :269-281 emits one
+    # entry per backlog name) so an entries-vs-backlog count check is
+    # unreachable and is not duplicated here.
+    backlog = report["totals"]["backlog"]
     if report["areas"] != on_disk.get("areas"):
         moved = sorted(
             area
