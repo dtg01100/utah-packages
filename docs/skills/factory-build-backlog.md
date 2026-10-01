@@ -40,7 +40,7 @@ The auditor classifies each catalog name into exactly one state:
 
 | State | Meaning |
 | --- | --- |
-| `already_recipe` | A directory exists under `packages/<name>/`, or the name is a `%package` subpackage of such a spec |
+| `already_recipe` | A directory exists under `packages/<name>/`, or the name is an unconditionally built `%package` subpackage of such a spec |
 | `already_locked` | `config/upstream-sources.json` has a lock entry |
 | `already_packit` | `.packit.yaml` has a package block |
 | `manifest_wants` | `config/bluefin-packages.toml` lists the name |
@@ -79,10 +79,21 @@ itself fails when the catalog totals do not reconcile with the report.
 - A `pending` count that shrinks without a commit means someone dropped a
   name from the catalog without recording the decision; `git log -p
   config/factory-build-backlog.toml` is the fastest trace.
-- `already_recipe` for a binary subpackage (`libavcodec`,
-  `gstreamer1-plugins-good-qt6`, ...) means the source package's recipe
-  declares it with a `%package` line: read the recipe, not the binary name.
-  The auditor resolves both `%package -n NAME` and `%package SUFFIX` (which
-  names `<spec>-SUFFIX`). A binary name no `%package` line declares — such
-  as `ffmpeg-libs`, which RPM never builds under that name here — stays
-  `pending` until the operator closes it in `[resolved]` or `[wontfix]`.
+- `already_recipe` for a binary subpackage (`libavcodec`, `libavformat`,
+  ...) means the source package's recipe declares it with a `%package`
+  line: read the recipe, not the binary name. The auditor resolves both
+  `%package -n NAME` and `%package SUFFIX` (which names `<spec>-SUFFIX`),
+  and only when the `%package` is reached by the default build. A binary
+  name no `%package` line declares — such as `ffmpeg-libs`, which RPM
+  never builds under that name here — stays `pending` until the operator
+  closes it in `[resolved]` or `[wontfix]`.
+- A `%package` behind a disabled or undecidable `%if` does not count.
+  `packages/gstreamer1-plugins-good/` declares `%package qt6` under `%if
+  %{with qt6}` while the spec sets `%bcond_with qt6` and nothing in the
+  factory passes `--with qt6`, so `gstreamer1-plugins-good-qt6` is
+  `pending`: the factory build does not produce it. `packages/ffmpeg/`
+  declares its `libav*` subpackages under `%if ! %{with freeworld_lavc}`,
+  which is true by default, so those are `already_recipe`. Conditions the
+  auditor cannot decide without a build target (`%ifarch`, `0%{?fedora}`)
+  are treated as not taken — an extra `pending` name is visible work, a
+  false `already_recipe` hides a gap.

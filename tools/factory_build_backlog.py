@@ -19,7 +19,10 @@ Partitions:
 - ``already_recipe``   — a directory exists under ``packages/<name>/``, or
   the name is a ``%package`` subpackage of such a spec (explicit
   ``%package -n NAME`` or implicit ``%package SUFFIX``, which names
-  ``<spec>-SUFFIX``): the factory build that ships the parent also ships it
+  ``<spec>-SUFFIX``): the factory build that ships the parent also ships
+  it. A ``%package`` guarded by an ``%if`` that is off or undecidable for
+  the default build does not count -- it is not built, so the name is
+  still owed.
 - ``already_locked``   — ``config/upstream-sources.json`` has a lock entry
 - ``already_packit``   — ``.packit.yaml`` has a package block
 - ``manifest_wants``   — ``config/bluefin-packages.toml`` lists the name
@@ -41,13 +44,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.package_inventory import inventory
+from tools.package_inventory import inventory, load_source_locks
 from tools.packit_workflow import package_names
 
 
@@ -76,10 +80,15 @@ def _packit_names(path: Path) -> set[str]:
 
 
 def _lock_names(path: Path) -> set[str]:
+    """Package names pinned in ``config/upstream-sources.json``.
+
+    Goes through :func:`tools.package_inventory.load_source_locks`, which the
+    factory documents as the only parse of that file: a duplicate lock or an
+    unknown stage must fail here exactly as it fails for every other reader.
+    """
     if not path.is_file():
         return set()
-    data = json.loads(path.read_text())
-    return {entry["name"] for entry in data.get("packages", [])}
+    return set(load_source_locks(path).keys())
 
 
 def _manifest_names(path: Path) -> set[str]:
@@ -133,6 +142,55 @@ def _expand_recipe_macro(value: str) -> str:
     return value
 
 
+def _bcond_state(line: str, bconds: dict[str, bool]) -> None:
+    """Record a ``%bcond*`` declaration in ``bconds``.
+
+    Three shapes exist: ``%bcond_with NAME`` (feature off by default),
+    ``%bcond_without NAME`` (on by default) and the modern
+    ``%bcond NAME DEFAULT`` where ``DEFAULT`` is ``0`` or ``1``. A later
+    declaration wins, which matches RPM's own last-definition-wins
+    behaviour when a spec redefines a bcond under an ``%if``.
+    """
+    tokens = line.split()
+    if len(tokens) < 2:
+        return
+    directive = tokens[0]
+    if directive == "%bcond_with":
+        bconds[tokens[1]] = False
+    elif directive == "%bcond_without":
+        bconds[tokens[1]] = True
+    elif directive == "%bcond" and len(tokens) >= 3:
+        try:
+            bconds[tokens[1]] = bool(int(tokens[2]))
+        except ValueError:
+            bconds.pop(tokens[1], None)
+
+
+_WITH_RE = re.compile(r"^(?P<negate>!\s*)?%\{(?P<kind>with|without)\s+(?P<name>[A-Za-z0-9_]+)\}$")
+
+
+def _eval_condition(expression: str, bconds: dict[str, bool]) -> bool | None:
+    """Truth of an ``%if`` expression, or ``None`` when it is not decidable.
+
+    Only the bcond forms the auditor can resolve are evaluated --
+    ``%{with X}``, ``%{without X}`` and their ``!`` negation. Everything
+    else (``0%{?fedora}``, ``%ifarch``, arithmetic comparisons) is
+    undecidable without a build target, and the auditor says so rather
+    than guessing a distro.
+    """
+    match = _WITH_RE.match(" ".join(expression.split()))
+    if match is None:
+        return None
+    value = bconds.get(match.group("name"))
+    if value is None:
+        return None
+    if match.group("kind") == "without":
+        value = not value
+    if match.group("negate"):
+        value = not value
+    return value
+
+
 def _subpackage_names(root: Path) -> set[str]:
     """Names declared by ``%package`` lines in every spec under ``packages/``.
 
@@ -144,15 +202,24 @@ def _subpackage_names(root: Path) -> set[str]:
       ``packages/ffmpeg/ffmpeg.spec`` ships ``libavcodec``).
     - ``%package SUFFIX`` — implicit; the subpackage is named
       ``{spec_name}-{SUFFIX}`` because RPM tacks the suffix onto the
-      spec's own ``Name:``. Fedora-style specs use this for split-out
-      build outputs that share the parent's provenance
-      (``%package qt6`` in ``packages/gstreamer1-plugins-good/`` ships
-      ``gstreamer1-plugins-good-qt6``).
+      spec's own ``Name:``.
 
-    Without parsing both shapes, the auditor counts the implicit-suffix
-    names as ``pending`` even though the factory build already ships them,
-    inflating the "pending" total and forcing the operator to close every
-    such name by hand.
+    A ``%package`` line only counts when every enclosing ``%if`` is known
+    to be taken for this factory's default build. ``%package qt6`` in
+    ``packages/gstreamer1-plugins-good/`` sits under ``%if %{with qt6}``
+    with ``%bcond_with qt6`` and nothing in the factory passing
+    ``--with qt6``, so that subpackage is never built and the name stays
+    in the backlog; ``packages/ffmpeg/`` declares its ``libav*``
+    subpackages under ``%if ! %{with freeworld_lavc}``, which is true by
+    default, so those do ship. Conditions the auditor cannot decide
+    (``%ifarch``, ``0%{?fedora}``) are treated as not taken: a missed
+    name shows up as ``pending`` work, while a false ``already_recipe``
+    would hide a real gap.
+
+    Without parsing both shapes, the auditor counts the unguarded
+    implicit-suffix names as ``pending`` even though the factory build
+    already ships them, inflating the "pending" total and forcing the
+    operator to close every such name by hand.
     """
     packages = root / "packages"
     if not packages.is_dir():
@@ -160,9 +227,40 @@ def _subpackage_names(root: Path) -> set[str]:
     names: set[str] = set()
     for spec in packages.glob("*/[!.]*.spec"):
         spec_name = spec.parent.name
+        bconds: dict[str, bool] = {}
+        # One frame per open ``%if``: ``True`` taken, ``False`` not taken,
+        # ``None`` undecidable. A ``%package`` counts only when every frame
+        # is ``True``.
+        stack: list[bool | None] = []
         for line in spec.read_text().splitlines():
             line = line.strip()
+            if line.startswith("%bcond"):
+                _bcond_state(line, bconds)
+                continue
+            if line.startswith("%if"):
+                directive, _, rest = line.partition(" ")
+                if directive == "%if":
+                    stack.append(_eval_condition(rest, bconds))
+                else:
+                    # ``%ifarch``/``%ifnarch``/``%ifos``: target-dependent.
+                    stack.append(None)
+                continue
+            if line.startswith("%elif"):
+                if stack:
+                    stack[-1] = None
+                continue
+            if line == "%else" or line.startswith("%else "):
+                if stack:
+                    current = stack[-1]
+                    stack[-1] = None if current is None else not current
+                continue
+            if line.startswith("%endif"):
+                if stack:
+                    stack.pop()
+                continue
             if not line.startswith("%package"):
+                continue
+            if any(frame is not True for frame in stack):
                 continue
             tokens = line.split(None, 3)
             if len(tokens) < 2:
@@ -175,10 +273,12 @@ def _subpackage_names(root: Path) -> set[str]:
                 candidate = _expand_recipe_macro(tokens[2]).strip()
             else:
                 # Implicit form: ``%package SUFFIX`` — RPM tacks the
-                # suffix onto the spec's ``Name:``. The spec directory
-                # matches the Name tag in this repo (enforced by
-                # ``_spec_per_package``), so the suffix shape names
-                # ``{spec_name}-{tokens[1]}``.
+                # suffix onto the spec's ``Name:`` tag, which the auditor
+                # does not parse. The directory name is used as an
+                # approximation of that tag (``_spec_per_package`` only
+                # enforces one spec per directory, not that the two
+                # agree), so a directory that renames the package yields
+                # a name that matches nothing -- a conservative miss.
                 suffix = tokens[1].strip()
                 candidate = f"{spec_name}-{suffix}"
             # ``-devel`` and other in-spec splits share the recipe's

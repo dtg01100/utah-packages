@@ -202,8 +202,12 @@ class SubpackageNameParserTests(unittest.TestCase):
     - ``%package SUFFIX`` — implicit name. RPM tacks the suffix onto the
       spec's ``Name:``. Fedora-style specs use this for split-out build
       outputs that share the parent's provenance
-      (``%package qt6`` in ``gstreamer1-plugins-good.spec`` ships
-      ``gstreamer1-plugins-good-qt6``).
+      (``%package qt6`` in ``gstreamer1-plugins-good.spec`` would ship
+      ``gstreamer1-plugins-good-qt6`` -- in that spec it is guarded by an
+      off-by-default bcond, so it does not).
+
+    Guards matter as much as shapes: a ``%package`` only counts when every
+    enclosing ``%if`` is known to be taken for the default build.
 
     Without parsing the second form, the auditor would count every
     implicit-suffix name as ``pending`` even though the factory build
@@ -242,6 +246,103 @@ class SubpackageNameParserTests(unittest.TestCase):
             self.assertIn("libavcodec", names)
             self.assertIn("gstreamer1-plugins-good-qt6", names)
             self.assertIn("gstreamer1-plugins-good-extras", names)
+
+    def test_disabled_bcond_guard_excludes_the_subpackage(self) -> None:
+        """``%package`` under an off-by-default ``%bcond`` is not shipped.
+
+        ``packages/gstreamer1-plugins-good/`` is the real shape: the spec
+        sets ``%bcond_with qt6`` and guards ``%package qt6`` with ``%if
+        %{with qt6}``. Nothing in this factory passes ``--with qt6``, so
+        the subpackage is never built and the backlog name is still owed.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "%bcond_with qt6\n"
+                "%package gtk\nSummary: gtk\n"
+                "%if %{with qt6}\n%package qt6\nSummary: qt6\n%endif\n"
+            )
+            self._spec(root, "gstreamer1-plugins-good", body)
+            names = backlog._subpackage_names(root)
+            self.assertIn("gstreamer1-plugins-good-gtk", names)
+            self.assertNotIn("gstreamer1-plugins-good-qt6", names)
+
+    def test_negated_off_bcond_guard_keeps_the_subpackage(self) -> None:
+        """``%if ! %{with freeworld_lavc}`` is true, so ``libav*`` ships.
+
+        This is ``packages/ffmpeg/``: the whole ``libav*`` block sits under
+        a negated bcond that is off by default, so the default build does
+        produce those subpackages.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "%bcond freeworld_lavc 0\n"
+                "%if ! %{with freeworld_lavc}\n"
+                "%package -n libavcodec\nSummary: libavcodec\n"
+                "%endif\n"
+                "%if %{with freeworld_lavc}\n"
+                "%package -n libavcodec-freeworld\nSummary: freeworld\n"
+                "%endif\n"
+            )
+            self._spec(root, "ffmpeg", body)
+            names = backlog._subpackage_names(root)
+            self.assertIn("libavcodec", names)
+            self.assertNotIn("libavcodec-freeworld", names)
+
+    def test_bcond_without_defaults_the_feature_on(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = "%bcond_without qt5\n%if %{with qt5}\n%package qt\nSummary: qt\n%endif\n"
+            self._spec(root, "gstreamer1-plugins-good", body)
+            self.assertIn("gstreamer1-plugins-good-qt", backlog._subpackage_names(root))
+
+    def test_else_branch_of_a_known_condition_flips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "%bcond_with qt6\n"
+                "%if %{with qt6}\n%package qt6\nSummary: qt6\n"
+                "%else\n%package noqt\nSummary: noqt\n%endif\n"
+            )
+            self._spec(root, "gstreamer1-plugins-good", body)
+            names = backlog._subpackage_names(root)
+            self.assertNotIn("gstreamer1-plugins-good-qt6", names)
+            self.assertIn("gstreamer1-plugins-good-noqt", names)
+
+    def test_undecidable_guard_is_treated_as_not_built(self) -> None:
+        """A distro/arch guard the auditor cannot evaluate stays ``pending``.
+
+        The auditor has no build target, so ``%ifarch`` and ``0%{?fedora}``
+        are unknowable. A missed name is visible work in the backlog; a
+        false ``already_recipe`` would hide a real gap, which the tool's
+        contract forbids.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "%ifarch x86_64\n%package vpl\nSummary: vpl\n%endif\n"
+                "%if 0%{?fedora}\n%package extras\nSummary: extras\n%endif\n"
+            )
+            self._spec(root, "gstreamer1-plugins-good", body)
+            self.assertEqual(backlog._subpackage_names(root), set())
+
+    def test_nested_guards_require_every_frame_taken(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "%bcond_without extras\n%bcond_with qt6\n"
+                "%if %{with extras}\n"
+                "%package extras\nSummary: extras\n"
+                "%if %{with qt6}\n%package qt6\nSummary: qt6\n%endif\n"
+                "%package more\nSummary: more\n"
+                "%endif\n"
+            )
+            self._spec(root, "gstreamer1-plugins-good", body)
+            names = backlog._subpackage_names(root)
+            self.assertIn("gstreamer1-plugins-good-extras", names)
+            self.assertIn("gstreamer1-plugins-good-more", names)
+            self.assertNotIn("gstreamer1-plugins-good-qt6", names)
 
     def test_no_package_lines_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
