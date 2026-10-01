@@ -131,33 +131,53 @@ def _expand_recipe_macro(value: str) -> str:
 
 
 def _subpackage_names(root: Path) -> set[str]:
-    """Names declared by ``%package -n`` lines in every spec under ``packages/``.
+    """Names declared by ``%package`` lines in every spec under ``packages/``.
 
     A spec may declare multiple binary subpackages in addition to the
-    recipe directory itself (e.g. ``packages/ffmpeg/ffmpeg.spec`` ships
-    ``libavcodec``, ``libavformat``, ``libavutil``, ...). Without this
-    the auditor would count those names as ``pending`` even though a
-    factory build already produces them, which both inflates the
-    "pending" total and forces the operator to close every subpackage
-    by hand.
+    recipe directory itself. There are two ``%package`` shapes:
+
+    - ``%package -n NAME`` — explicit name; the subpackage is built and
+      named whatever ``NAME`` says (e.g. ``%package -n libavcodec`` in
+      ``packages/ffmpeg/ffmpeg.spec`` ships ``libavcodec``).
+    - ``%package SUFFIX`` — implicit; the subpackage is named
+      ``{spec_name}-{SUFFIX}`` because RPM tacks the suffix onto the
+      spec's own ``Name:``. Fedora-style specs use this for split-out
+      build outputs that share the parent's provenance
+      (``%package qt6`` in ``packages/gstreamer1-plugins-good/`` ships
+      ``gstreamer1-plugins-good-qt6``).
+
+    Without parsing both shapes, the auditor counts the implicit-suffix
+    names as ``pending`` even though the factory build already ships them,
+    inflating the "pending" total and forcing the operator to close every
+    such name by hand.
     """
     packages = root / "packages"
     if not packages.is_dir():
         return set()
     names: set[str] = set()
     for spec in packages.glob("*/[!.]*.spec"):
+        spec_name = spec.parent.name
         for line in spec.read_text().splitlines():
             line = line.strip()
             if not line.startswith("%package"):
                 continue
-            # RPM's ``%package -n NAME`` lets the spec reuse the global
-            # Name with a different one. We only care about the explicit
-            # form; ``%package`` (no ``-n``) inherits the spec's own Name
-            # which the recipe directory already covers.
             tokens = line.split(None, 3)
-            if len(tokens) < 3 or tokens[1] != "-n":
+            if len(tokens) < 2:
                 continue
-            candidate = _expand_recipe_macro(tokens[2]).strip()
+            if tokens[1] == "-n":
+                # Explicit form: ``%package -n NAME`` — the subpackage's
+                # own name, which may differ entirely from the spec's.
+                if len(tokens) < 3:
+                    continue
+                candidate = _expand_recipe_macro(tokens[2]).strip()
+            else:
+                # Implicit form: ``%package SUFFIX`` — RPM tacks the
+                # suffix onto the spec's ``Name:``. The spec directory
+                # matches the Name tag in this repo (enforced by
+                # ``_spec_per_package``), so the suffix shape names
+                # ``{spec_name}-{tokens[1]}``.
+                suffix = tokens[1].strip()
+                candidate = f"{spec_name}-{suffix}"
             # ``-devel`` and other in-spec splits share the recipe's
             # provenance; classifying them under ``already_recipe`` is
             # the right signal -- the factory build that ships the

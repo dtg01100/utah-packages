@@ -181,6 +181,70 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(state, "already_recipe")
 
 
+class SubpackageNameParserTests(unittest.TestCase):
+    """``_subpackage_names`` reads every ``%package`` shape a spec may use.
+
+    Two forms are equivalent to RPM:
+
+    - ``%package -n NAME`` — explicit name. Common for library subpackages
+      whose name does not share the spec's prefix
+      (``%package -n libavcodec`` in ``ffmpeg.spec``).
+    - ``%package SUFFIX`` — implicit name. RPM tacks the suffix onto the
+      spec's ``Name:``. Fedora-style specs use this for split-out build
+      outputs that share the parent's provenance
+      (``%package qt6`` in ``gstreamer1-plugins-good.spec`` ships
+      ``gstreamer1-plugins-good-qt6``).
+
+    Without parsing the second form, the auditor would count every
+    implicit-suffix name as ``pending`` even though the factory build
+    already ships it as part of the parent recipe. The test fixtures
+    mirror those real shapes, not the abstract ones.
+    """
+
+    def _spec(self, root: Path, recipe: str, body: str) -> None:
+        spec_dir = root / "packages" / recipe
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        spec_path = spec_dir / f"{recipe}.spec"
+        spec_path.write_text(f"Name: {recipe}\nVersion: 0\n\n{body}\n")
+
+    def test_explicit_n_form_picks_the_explicit_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._spec(root, "ffmpeg", "%package -n libavcodec\nSummary: libavcodec\n")
+            self.assertIn("libavcodec", backlog._subpackage_names(root))
+
+    def test_implicit_suffix_form_picks_spec_name_dash_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._spec(root, "gstreamer1-plugins-good", "%package qt6\nSummary: qt6\n")
+            self.assertIn("gstreamer1-plugins-good-qt6", backlog._subpackage_names(root))
+
+    def test_both_shapes_in_one_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "%package -n libavcodec\nSummary: libavcodec\n"
+                "%package qt6\nSummary: qt6\n"
+                "%package extras\nSummary: extras\n"
+            )
+            self._spec(root, "gstreamer1-plugins-good", body)
+            names = backlog._subpackage_names(root)
+            self.assertIn("libavcodec", names)
+            self.assertIn("gstreamer1-plugins-good-qt6", names)
+            self.assertIn("gstreamer1-plugins-good-extras", names)
+
+    def test_no_package_lines_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._spec(root, "fish", "%description\nBuilt by the factory.\n")
+            self.assertEqual(backlog._subpackage_names(root), set())
+
+    def test_packages_directory_absent_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(backlog._subpackage_names(root), set())
+
+
 class PackitAndLockTests(unittest.TestCase):
     def test_packit_names_returns_every_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

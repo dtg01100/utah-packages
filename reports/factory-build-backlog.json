@@ -1,8 +1,8 @@
 {
   "areas": {
     "codecs-media": {
-      "already_recipe": 8,
-      "pending": 41,
+      "already_recipe": 9,
+      "pending": 40,
       "total": 49
     },
     "dev-tools": {
@@ -112,7 +112,7 @@
     {
       "area": "codecs-media",
       "name": "gstreamer1-plugins-good-qt6",
-      "state": "pending"
+      "state": "already_recipe"
     },
     {
       "area": "codecs-media",
@@ -2807,9 +2807,9 @@
   ],
   "issue": "projectbluefin/utah-packages#308",
   "states": {
-    "already_recipe": 8,
+    "already_recipe": 9,
     "manifest_wants": 1,
-    "pending": 542
+    "pending": 541
   },
   "totals": {
     "backlog": 551,
