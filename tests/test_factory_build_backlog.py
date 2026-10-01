@@ -19,6 +19,8 @@ exercised without pulling or modifying the live repository.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import tempfile
 import tomllib
 import unittest
@@ -26,9 +28,6 @@ from pathlib import Path
 from unittest import mock
 
 from tools import factory_build_backlog as backlog
-
-
-PACKAGE_KEY = backlog.PACKAGE_KEY
 
 
 def _toml(catalog_root: Path, areas: dict[str, list[str]], resolved: list[str] | None = None, wontfix: list[str] | None = None) -> Path:
@@ -144,27 +143,23 @@ class ClassifyTests(unittest.TestCase):
     """The partition order is significant: the strongest signal wins."""
 
     def test_recipe_wins_over_lock(self) -> None:
-        state = backlog._classify("fish", recipes={"fish"}, locks={"fish"}, packit={"fish"}, manifest={"fish"}, wontfix=set())
+        state = backlog._classify("fish", recipes={"fish"}, locks={"fish"}, packit={"fish"}, manifest={"fish"})
         self.assertEqual(state, "already_recipe")
 
     def test_lock_wins_over_packit(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks={"fish"}, packit={"fish"}, manifest={"fish"}, wontfix=set())
+        state = backlog._classify("fish", recipes=set(), locks={"fish"}, packit={"fish"}, manifest={"fish"})
         self.assertEqual(state, "already_locked")
 
     def test_packit_wins_over_manifest(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit={"fish"}, manifest={"fish"}, wontfix=set())
+        state = backlog._classify("fish", recipes=set(), locks=set(), packit={"fish"}, manifest={"fish"})
         self.assertEqual(state, "already_packit")
 
     def test_manifest_wins_over_pending(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest={"fish"}, wontfix=set())
+        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest={"fish"})
         self.assertEqual(state, "manifest_wants")
 
-    def test_wontfix_resolved(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest=set(), wontfix={"fish"})
-        self.assertEqual(state, "wontfix_resolved")
-
     def test_pending_when_no_signal(self) -> None:
-        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest=set(), wontfix=set())
+        state = backlog._classify("fish", recipes=set(), locks=set(), packit=set(), manifest=set())
         self.assertEqual(state, "pending")
 
 
@@ -219,6 +214,7 @@ class PackitAndLockTests(unittest.TestCase):
 class ReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="backlog-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
     def _write(self) -> Path:
         catalog_path = _toml(
@@ -416,6 +412,58 @@ class CheckGateTests(unittest.TestCase):
             report = backlog._report(root, catalog_path)
             snapshot = root / "reports" / "factory-build-backlog.json"
             self.assertEqual(backlog._check(report, snapshot), 1)
+
+    def test_check_fails_when_a_name_moved_between_areas(self) -> None:
+        """Totals and states are blind to a move; areas and entries are not."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog_path = _toml(
+                root,
+                areas={"power": ["tuned"], "codecs-media": ["ffmpeg"]},
+            )
+            _populate(root, recipes=[], locked=[], packit=[], manifest=[])
+            report = backlog._report(root, catalog_path)
+            stale = json.loads(json.dumps(report))
+            for entry in stale["entries"]:
+                entry["area"] = "power" if entry["area"] == "codecs-media" else "codecs-media"
+            stale["areas"] = {
+                "power": report["areas"]["codecs-media"],
+                "codecs-media": report["areas"]["power"],
+            }
+            self.assertEqual(stale["totals"], report["totals"])
+            self.assertEqual(stale["states"], report["states"])
+            snapshot = root / "reports" / "factory-build-backlog.json"
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.write_text(json.dumps(stale, indent=2, sort_keys=True) + "\n")
+            self.assertEqual(backlog._check(report, snapshot), 1)
+
+    def test_report_has_no_wall_clock_field(self) -> None:
+        """Two runs of the same tree must produce identical bytes."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog_path = _toml(root, areas={"power": ["tuned"]})
+            _populate(root, recipes=[], locked=[], packit=[], manifest=[])
+            first = backlog._report(root, catalog_path)
+            second = backlog._report(root, catalog_path)
+            self.assertNotIn("measured_at", first)
+            self.assertEqual(
+                json.dumps(first, indent=2, sort_keys=True),
+                json.dumps(second, indent=2, sort_keys=True),
+            )
+
+    def test_check_resolves_paths_against_root_not_cwd(self) -> None:
+        """``--root <tree> --check`` must work from any working directory."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as elsewhere:
+            root = Path(directory)
+            _toml(root, areas={"power": ["tuned"]})
+            _populate(root, recipes=[], locked=[], packit=[], manifest=[])
+            self.assertEqual(backlog.main(["--root", str(root)]), 0)
+            cwd = os.getcwd()
+            os.chdir(elsewhere)
+            try:
+                self.assertEqual(backlog.main(["--root", str(root), "--check"]), 0)
+            finally:
+                os.chdir(cwd)
 
 
 if __name__ == "__main__":

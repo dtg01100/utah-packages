@@ -9,8 +9,10 @@ explicit wontfix; tracking its real state is what this tool exists to do.
 The tool takes ``config/factory-build-backlog.toml`` as the source of truth
 (so adding a name is one PR), partitions every entry by where it stands in
 the factory today, and emits ``reports/factory-build-backlog.json`` as a
-deterministic snapshot. ``--check`` exits 1 if the snapshot is stale or if
-the catalog itself is malformed, so the snapshot stays trustworthy in CI.
+deterministic snapshot: the report carries no wall-clock field, so a run
+that changes nothing rewrites the file byte-for-byte. ``--check`` exits 1
+if the snapshot is stale or if the catalog itself is malformed, so the
+snapshot stays trustworthy in CI.
 
 Partitions:
 
@@ -19,23 +21,25 @@ Partitions:
 - ``already_packit``   — ``.packit.yaml`` has a package block
 - ``manifest_wants``   — ``config/bluefin-packages.toml`` lists the name
 - ``pending``          — none of the above; a factory build is still owed
-- ``wontfix_resolved`` — listed in ``[wontfix]`` of the catalog
+
+Names in ``[wontfix]`` have left the backlog, so they are never report
+entries: the catalog contract forbids a name from being in an area and in
+``[wontfix]`` at once, and ``--check`` rejects a catalog that does it.
+``[wontfix]`` is counted in ``totals``, not partitioned.
 
 The report records every name once with the partition it falls into and a
 per-area rollup. Counts always reconcile: ``total = already_recipe + (else
 already_locked + (else already_packit + (else manifest_wants + (else
-pending + wontfix_resolved)))))`` -- because each check is strictly weaker
-than the previous, the most-specific state wins.
+pending))))`` -- because each check is strictly weaker than the previous,
+the most-specific state wins.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import tomllib
-from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -50,11 +54,6 @@ PACKIT_PATH = Path(".packit.yaml")
 UPSTREAM_PATH = Path("config/upstream-sources.json")
 MANIFEST_PATH = Path("config/bluefin-packages.toml")
 
-# Packit package blocks are top-level keys under `packages:`. The regex is the
-# one in tools/packit_workflow.py; copy-pasted here so the audit only depends on
-# the same primitive the rest of the codebase already trusts.
-PACKAGE_KEY = re.compile(r"^  ([a-zA-Z0-9][a-zA-Z0-9+._-]*):$")
-
 
 def _load_catalog(path: Path) -> dict:
     with path.open("rb") as handle:
@@ -64,8 +63,9 @@ def _load_catalog(path: Path) -> dict:
 def _packit_names(path: Path) -> set[str]:
     """Package names declared in the root ``.packit.yaml`` ``packages:`` block.
 
-    Duplicates ``tools.packit_workflow.package_names`` so this audit does not
-    depend on Packit's load-time configuration (which is YAML, not TOML).
+    Delegates to ``tools.packit_workflow.package_names`` so the audit reads
+    the Packit config through the same primitive the rest of the codebase
+    already trusts.
     """
     if not path.is_file():
         return set()
@@ -100,16 +100,19 @@ def _recipe_names(root: Path) -> set[str]:
     return {d.name for d in packages.iterdir() if d.is_dir()}
 
 
-def _classify(name: str, *, recipes: set[str], locks: set[str], packit: set[str], manifest: set[str], wontfix: set[str]) -> str:
+def _classify(name: str, *, recipes: set[str], locks: set[str], packit: set[str], manifest: set[str]) -> str:
     """Pick the most-specific partition a name falls into.
 
     Order is significant: the first match wins. ``already_recipe`` is the
     strongest signal (a full spec + provenance + sources file is present),
     then ``already_locked`` (source URL is SHA-512 pinned), then
     ``already_packit`` (Packit block declared), then ``manifest_wants``
-    (consumer asks for it), then ``wontfix_resolved`` (catalog records an
-    explicit decision not to carry), then ``pending`` (a factory build is
-    still owed). Reordering this list silently changes counts.
+    (consumer asks for it), then ``pending`` (a factory build is still
+    owed). Reordering this list silently changes counts.
+
+    Wontfixed names are not classified: leaving the backlog removes the name
+    from every area, and ``_report`` rejects a catalog where an area name is
+    also in ``[wontfix]``.
     """
     if name in recipes:
         return "already_recipe"
@@ -119,8 +122,6 @@ def _classify(name: str, *, recipes: set[str], locks: set[str], packit: set[str]
         return "already_packit"
     if name in manifest:
         return "manifest_wants"
-    if name in wontfix:
-        return "wontfix_resolved"
     return "pending"
 
 
@@ -131,8 +132,6 @@ def _catalog_totals(catalog: dict) -> tuple[set[str], dict[str, set[str]], set[s
         backlog[area] = set(info.get("packages", []))
     resolved = {entry["name"] for entry in catalog.get("resolved", {}).get("packages", [])}
     wontfix = {entry["name"] for entry in catalog.get("wontfix", {}).get("packages", [])}
-    # Anything in ``resolved`` or ``wontfix`` is no longer backlog.
-    already_resolved = resolved | wontfix
     all_backlog: set[str] = set()
     for names in backlog.values():
         all_backlog.update(names)
@@ -189,7 +188,7 @@ def _report(root: Path, catalog_path: Path) -> dict:
     entries: list[dict] = []
     for area in sorted(by_area):
         for name in sorted(by_area[area]):
-            state = _classify(name, recipes=recipes, locks=locks, packit=packit, manifest=manifest, wontfix=wontfix_set)
+            state = _classify(name, recipes=recipes, locks=locks, packit=packit, manifest=manifest)
             partition_counts[state] = partition_counts.get(state, 0) + 1
             entries.append(
                 {
@@ -210,7 +209,6 @@ def _report(root: Path, catalog_path: Path) -> dict:
         area_rollup[area] = dict(sorted(rollup.items()))
 
     report = {
-        "measured_at": datetime.now(UTC).isoformat(),
         "issue": meta.get("issue", ""),
         "audit_source": meta.get("audit_source", ""),
         "audit_measured_at": meta.get("audit_measured_at", ""),
@@ -231,11 +229,10 @@ def _report(root: Path, catalog_path: Path) -> dict:
     # mean a recipe was added without updating upstream-sources.json; this is
     # what catches a half-imported name that the backlog would otherwise call
     # resolved.
-    records = inventory(root)
-    packit_names = {r.name for r in records}
+    locked_records = {record.name for record in inventory(root) if record.source_locked}
     inconsistent = []
     for entry in entries:
-        if entry["state"] == "already_recipe" and entry["name"] not in packit_names:
+        if entry["state"] == "already_recipe" and entry["name"] not in locked_records:
             inconsistent.append(entry["name"])
     if inconsistent:
         report["inconsistent_recipe_state"] = sorted(inconsistent)
@@ -243,43 +240,24 @@ def _report(root: Path, catalog_path: Path) -> dict:
 
 
 def _check(report: dict, path: Path) -> int:
-    """Verify the catalog is well-formed against the current repo state.
+    """Verify the committed snapshot still matches the live repository state.
 
-    ``--check`` is the CI gate. It does NOT compare the full JSON snapshot
-    (the ``measured_at`` timestamp legitimately drifts on every run);
-    instead it verifies that:
-
-    - every catalog name is accounted for in the report, exactly once;
-    - the catalog and report partition counts reconcile;
-    - no catalog name appears in more than one area.
-
-    The committed snapshot in ``reports/factory-build-backlog.json`` is the
-    durable audit output (regenerated by the recalc workflow); ``--check`` is the
-    gate the workflow itself runs against the live tree.
+    ``--check`` is the gate. The report carries no wall-clock field, so the
+    live report and the committed snapshot must be equal byte-for-byte;
+    anything else is drift. The messages below name the drifting section
+    (totals, states, entry count, areas, entries, recipe consistency) so a
+    failure says what moved instead of dumping two large dicts.
     """
-    catalog = _load_catalog(path.parent.parent / CATALOG_PATH if not path.is_absolute() else CATALOG_PATH)
-    # ``catalog`` is loaded here only so the contract stays anchored to the
-    # TOML catalog file; partition math already runs in ``_report``.
-    del catalog
-
-    on_disk_path = path
-    if not on_disk_path.is_file():
-        print(f"missing snapshot at {on_disk_path}; run without --check to regenerate")
+    if not path.is_file():
+        print(f"missing snapshot at {path}; run without --check to regenerate")
         return 1
 
-    # Recompute from the on-disk snapshot the same way we did live, ignoring
-    # ``measured_at``: the audit's deterministic content is the catalog-vs-
-    # state partitioning, which is what we gate on.
-    on_disk = json.loads(on_disk_path.read_text())
-    live_totals = report["totals"]
-    live_states = report["states"]
-    on_disk_totals = on_disk["totals"]
-    on_disk_states = on_disk["states"]
+    on_disk = json.loads(path.read_text())
     errors = []
-    if live_totals != on_disk_totals:
-        errors.append(f"totals drift: live {live_totals} vs snapshot {on_disk_totals}")
-    if live_states != on_disk_states:
-        errors.append(f"states drift: live {live_states} vs snapshot {on_disk_states}")
+    if report["totals"] != on_disk.get("totals"):
+        errors.append(f"totals drift: live {report['totals']} vs snapshot {on_disk.get('totals')}")
+    if report["states"] != on_disk.get("states"):
+        errors.append(f"states drift: live {report['states']} vs snapshot {on_disk.get('states')}")
     # Catalog-vs-live: the catalog has ``N`` backlog names; the report's
     # entries list has exactly ``N`` items. A count mismatch is a catalog
     # regression (someone added a name without updating the report).
@@ -287,11 +265,36 @@ def _check(report: dict, path: Path) -> int:
     entries = len(report["entries"])
     if entries != backlog:
         errors.append(f"entries drift: {entries} entries for {backlog} backlog names")
+    # Totals and states are blind to a name moving between areas or two names
+    # of the same state swapping places, so compare the rollup and the entry
+    # list themselves.
+    if report["areas"] != on_disk.get("areas"):
+        moved = sorted(
+            area
+            for area in set(report["areas"]) | set(on_disk.get("areas", {}))
+            if report["areas"].get(area) != on_disk.get("areas", {}).get(area)
+        )
+        errors.append(f"areas drift: {moved}")
+    if report["entries"] != on_disk.get("entries"):
+        live_entries = {entry["name"]: entry for entry in report["entries"]}
+        disk_entries = {entry["name"]: entry for entry in on_disk.get("entries", [])}
+        changed = sorted(
+            name
+            for name in set(live_entries) | set(disk_entries)
+            if live_entries.get(name) != disk_entries.get(name)
+        )
+        errors.append(f"entries drift: {changed}")
+    if report.get("inconsistent_recipe_state") != on_disk.get("inconsistent_recipe_state"):
+        errors.append(
+            "inconsistent_recipe_state drift: live "
+            f"{report.get('inconsistent_recipe_state')} vs snapshot "
+            f"{on_disk.get('inconsistent_recipe_state')}"
+        )
     if errors:
         for error in errors:
             print(error)
         return 1
-    print(f"factory-build-backlog snapshot consistent ({backlog} entries, {on_disk_states.get('pending', 0)} pending)")
+    print(f"factory-build-backlog snapshot consistent ({backlog} entries, {report['states'].get('pending', 0)} pending)")
     return 0
 
 
